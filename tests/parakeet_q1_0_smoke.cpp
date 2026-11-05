@@ -8,12 +8,18 @@
 // parakeet_q1_0_as_f32.gguf holds the same weights decoded to F32, in the
 // usual layouts.
 //
+// parakeet_q1_0_int8_input.gguf adds stt.parakeet.encoder.input_quant =
+// "int8_per_frame"; parakeet_q1_0_bad_input_quant.gguf an unsupported value.
+//
 // Asserts, through the public load path:
-//   1. both files load, and the Q1_0 tensors keep their type and layout
+//   1. the files load, and the Q1_0 tensors keep their type and layout
 //      (no load-time promotion or reshape);
-//   2. both transcribe a clip with the default pointwise dispatch and with
+//   2. they transcribe a clip with the default pointwise dispatch and with
 //      TRANSCRIBE_CONV_NO_DIRECT_PW=1, which must not send a Q1_0 kernel to
-//      the im2col path.
+//      the im2col path;
+//   3. input quantization is on exactly when the key says int8_per_frame
+//      (absent keeps it off), and an unknown value fails the load.
+// Numerical parity of the quantizer lives in conformer_input_quant_unit.
 // Numerical parity of the Q1_0 conv module lives in quant_q1_0_unit.
 
 #include "arch/parakeet/parakeet.h"
@@ -108,7 +114,11 @@ std::vector<float> make_clip() {
     return pcm;
 }
 
-void check_model(const char * name, bool q1, transcribe_backend_request backend, const std::vector<float> & pcm) {
+void check_model(const char *               name,
+                 bool                       q1,
+                 bool                       input_quant,
+                 transcribe_backend_request backend,
+                 const std::vector<float> & pcm) {
     transcribe_model_load_params mp;
     transcribe_model_load_params_init(&mp);
     mp.backend                 = backend;
@@ -119,6 +129,7 @@ void check_model(const char * name, bool q1, transcribe_backend_request backend,
         return;
     }
     check_layout(m, q1);
+    CHECK(static_cast<const transcribe::parakeet::ParakeetModel *>(m)->hparams.enc_input_quant_int8 == input_quant);
 
     const char * policies[2] = { nullptr, "1" };
     for (const char * no_direct : policies) {
@@ -148,8 +159,20 @@ int main() {
 
     const transcribe_backend_request backends[2] = { TRANSCRIBE_BACKEND_CPU, TRANSCRIBE_BACKEND_AUTO };
     for (transcribe_backend_request backend : backends) {
-        check_model("parakeet_q1_0.gguf", true, backend, pcm);
-        check_model("parakeet_q1_0_as_f32.gguf", false, backend, pcm);
+        check_model("parakeet_q1_0.gguf", true, false, backend, pcm);
+        check_model("parakeet_q1_0_as_f32.gguf", false, false, backend, pcm);
+        check_model("parakeet_q1_0_int8_input.gguf", true, true, backend, pcm);
+    }
+
+    {
+        transcribe_model_load_params mp;
+        transcribe_model_load_params_init(&mp);
+        mp.backend                = TRANSCRIBE_BACKEND_CPU;
+        transcribe_model *      m = nullptr;
+        const transcribe_status st =
+            transcribe_model_load_file(fixture("parakeet_q1_0_bad_input_quant.gguf").c_str(), &mp, &m);
+        CHECK(st != TRANSCRIBE_OK && m == nullptr);
+        transcribe_model_free(m);
     }
 
     if (g_failures > 0) {

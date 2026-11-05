@@ -67,6 +67,13 @@ bool detect_direct_dw_in_pre_encode(const char * backend) {
                                      /*backend_default=*/!is_metal);
 }
 
+conf::InputQuantParams input_quant_of(const ParakeetHParams & hp, const char * backend_name) {
+    conf::InputQuantParams iq;
+    iq.mode    = hp.enc_input_quant_int8 ? conf::InputQuant::Int8PerFrame : conf::InputQuant::None;
+    iq.row_max = conf::row_max_for_backend(backend_name);
+    return iq;
+}
+
 // ----- Views ------------------------------------------------------
 
 conf::PreEncodeView to_view(const ParakeetPreEncode & pe) {
@@ -615,6 +622,7 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         bparams.conv_norm_type     = (hp.enc_conv_norm_type == ParakeetHParams::ConvNormType::LayerNorm) ?
                                          conf::BlockParams::ConvNormType::LayerNorm :
                                          conf::BlockParams::ConvNormType::BatchNorm;
+        bparams.input_quant        = input_quant_of(hp, backend_name);
 
         // Block 0: shared helper + the dump observer.
         {
@@ -938,6 +946,7 @@ EncoderBuild build_encoder_graph_streaming(ggml_context *            ctx,
     bparams.conv_norm_type     = (hp.enc_conv_norm_type == ParakeetHParams::ConvNormType::LayerNorm) ?
                                      conf::BlockParams::ConvNormType::LayerNorm :
                                      conf::BlockParams::ConvNormType::BatchNorm;
+    bparams.input_quant        = input_quant_of(hp, backend_name);
     bparams.streaming_graph    = eb.graph;
     bparams.streaming_T_q_new  = static_cast<int>(T_q_new);
 

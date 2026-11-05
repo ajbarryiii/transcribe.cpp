@@ -106,6 +106,11 @@ Fixtures emitted (see emit_fixtures for the full list):
   parakeet_q1_0_as_f32.gguf -- the same weights in F32, decoded, with the
                               pointwise kernels in the [1, in, out] conv
                               layout.
+  parakeet_q1_0_int8_input.gguf -- parakeet_q1_0.gguf with
+                              stt.parakeet.encoder.input_quant =
+                              "int8_per_frame".
+  parakeet_q1_0_bad_input_quant.gguf -- the same with an unsupported
+                              input_quant value.
 
 Run:
 
@@ -2160,7 +2165,12 @@ def emit_fixtures(out_dir: Path) -> None:
     # Parakeet with Q1_0 encoder linears and pointwise kernels (the latter in
     # the [in, out] layout), and the same model in F32 with the decoded
     # weights and [1, in, out] pointwise kernels.
-    for suffix, as_f32 in (("", False), ("_as_f32", True)):
+    # The Q1_0 model also with stt.parakeet.encoder.input_quant: the INT8
+    # activation quantizer it would be trained with, and a value the loader
+    # must reject.
+    for suffix, as_f32, input_quant in (("", False, None), ("_as_f32", True, None),
+                                        ("_int8_input", False, "int8_per_frame"),
+                                        ("_bad_input_quant", False, "int4_per_frame")):
         _write(
             out_dir / f"parakeet_q1_0{suffix}.gguf",
             _build_full_gguf(
@@ -2170,6 +2180,8 @@ def emit_fixtures(out_dir: Path) -> None:
                     _pack_kv_string("stt.variant", "tdt-0.6b-v2"),
                     *tokenizer_kv,
                     *_parakeet_hparams_kv(PARAKEET_Q1_0_HP),
+                    *([] if input_quant is None else
+                      [_pack_kv_string("stt.parakeet.encoder.input_quant", input_quant)]),
                 ],
                 _parakeet_q1_0_tensors(as_f32),
             ),

@@ -406,6 +406,22 @@ transcribe_apply_warnings(transcribe_quant_q1_0_unit)
 add_test(NAME transcribe_quant_q1_0_unit
     COMMAND transcribe_quant_q1_0_unit)
 
+# conformer::InputQuant: the per-frame INT8 input quantizer against the
+# training formula, and a conformer block with it against a host reference.
+
+add_executable(transcribe_conformer_input_quant_unit
+    conformer_input_quant_unit.cpp)
+
+target_link_libraries(transcribe_conformer_input_quant_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_conformer_input_quant_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_conformer_input_quant_unit)
+
+add_test(NAME transcribe_conformer_input_quant_unit
+    COMMAND transcribe_conformer_input_quant_unit)
+
 # -----------------------------------------------------------------------------
 # Dispatcher-level transcribe_run behavior
 # -----------------------------------------------------------------------------
@@ -602,6 +618,8 @@ set(TRANSCRIBE_FIXTURE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_q8_0_as_f16.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0_as_f32.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0_int8_input.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0_bad_input_quant.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_hop0.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_win_gt_fft.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_silero_vad.gguf

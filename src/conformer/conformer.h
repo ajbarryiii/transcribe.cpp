@@ -149,6 +149,39 @@ bool resolve_conv_direct(const char * direct_env, const char * no_direct_env, bo
 // f32 weights. Metal and CPU prefer direct.
 bool detect_direct_pw(const char * backend);
 
+// Fake quantization of the input of every block projection (FF linear1/2,
+// attention q/k/v/out/pos, conv pointwise 1/2), for checkpoints trained with
+// quantized activations. None leaves the graph unchanged.
+//
+//   Int8PerFrame: per frame (one ne[0] row) across the input features,
+//     s = max(max|x| / 127, 1e-30), q = round-half-even(x / s), x' = q * s,
+//     in F32. q lies in [-127, 127] by construction.
+enum class InputQuant { None, Int8PerFrame };
+
+// How Int8PerFrame finds each frame's max|x|: the value at top_k(|x|, 1) or
+// at argmax(|x|). Both are exact, so this is only a speed choice per backend.
+// TopK is row-parallel on the CPU and Vulkan; Metal's top_k sorts the row,
+// while its argmax is a simdgroup reduction.
+enum class RowMax { TopK, ArgMax };
+
+// The faster RowMax for a backend, by its ggml_backend_name ("MTL0" -> ArgMax).
+RowMax row_max_for_backend(const char * backend_name);
+
+// Int8PerFrame on x (F32, contiguous rows): every ne[0] row is one frame.
+// Built from ops CPU, Metal and Vulkan all run (abs, top_k or argmax,
+// get_rows, div, clamp, scale, mul); half-to-even rounding is
+// (y + 1.5 * 2^23) - 1.5 * 2^23 in two separately rounded F32 adds, exact for
+// |y| <= 127.
+ggml_tensor * fake_quant_int8_per_frame(ggml_context * ctx, ggml_tensor * x, RowMax row_max = RowMax::TopK);
+
+struct InputQuantParams {
+    InputQuant mode    = InputQuant::None;
+    RowMax     row_max = RowMax::TopK;
+};
+
+// x quantized as `iq` says (x itself for InputQuant::None).
+ggml_tensor * quant_input(ggml_context * ctx, ggml_tensor * x, const InputQuantParams & iq);
+
 // Scalar knobs for the block forward. All fields required except the
 // optional local-attention window (att_context_left / att_context_right).
 struct BlockParams {
@@ -219,6 +252,11 @@ struct BlockParams {
     int conv_context_left  = -1;
     int conv_context_right = -1;
 
+    // Input fake quantization of every projection in the block (see
+    // InputQuant). Int8PerFrame also forces the direct pointwise path, whose
+    // [d_model, T] layout keeps one frame per row.
+    InputQuantParams input_quant;
+
     // Optional post-GLU valid-frame mask for the conv module. Values 1.0
     // for valid frames and 0.0 for padded overhang; multiplied onto x at
     // ne=[T, d_model, B, 1], so it broadcasts over d_model (ne[1]). Shape
@@ -287,23 +325,26 @@ ggml_tensor * named(ggml_tensor * t, const char * name);
 ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * gamma, ggml_tensor * beta);
 
 // Two-linear FeedForward: y = Linear2(SiLU(Linear1(x))). Biases are
-// optional — pass nullptr to skip the add.
-ggml_tensor * feed_forward(ggml_context * ctx,
-                           ggml_tensor *  x,
-                           ggml_tensor *  lin1_w,
-                           ggml_tensor *  lin1_b,
-                           ggml_tensor *  lin2_w,
-                           ggml_tensor *  lin2_b);
+// optional — pass nullptr to skip the add. `input_quant` applies to the
+// input of both linears.
+ggml_tensor * feed_forward(ggml_context *           ctx,
+                           ggml_tensor *            x,
+                           ggml_tensor *            lin1_w,
+                           ggml_tensor *            lin1_b,
+                           ggml_tensor *            lin2_w,
+                           ggml_tensor *            lin2_b,
+                           const InputQuantParams & input_quant = InputQuantParams{});
 
 // Macaron half-residual FF: x + 0.5 * FeedForward(LayerNorm(x)).
-ggml_tensor * macaron_ff_residual(ggml_context * ctx,
-                                  ggml_tensor *  x,
-                                  ggml_tensor *  norm_w,
-                                  ggml_tensor *  norm_b,
-                                  ggml_tensor *  lin1_w,
-                                  ggml_tensor *  lin1_b,
-                                  ggml_tensor *  lin2_w,
-                                  ggml_tensor *  lin2_b);
+ggml_tensor * macaron_ff_residual(ggml_context *           ctx,
+                                  ggml_tensor *            x,
+                                  ggml_tensor *            norm_w,
+                                  ggml_tensor *            norm_b,
+                                  ggml_tensor *            lin1_w,
+                                  ggml_tensor *            lin1_b,
+                                  ggml_tensor *            lin2_w,
+                                  ggml_tensor *            lin2_b,
+                                  const InputQuantParams & input_quant = InputQuantParams{});
 
 // Shaw / Transformer-XL relative-position skew. Turns a
 // [pos_len, T_q, H, 1] score matrix into a [pos_len, T_q, H, 1]

@@ -14,6 +14,7 @@
 #include "transcribe-log.h"
 
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -41,21 +42,56 @@ ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * gamm
     return y;
 }
 
+RowMax row_max_for_backend(const char * backend_name) {
+    const bool metal = backend_name != nullptr &&
+                       (std::strncmp(backend_name, "MTL", 3) == 0 || std::strstr(backend_name, "Metal") != nullptr);
+    return metal ? RowMax::ArgMax : RowMax::TopK;
+}
+
+ggml_tensor * fake_quant_int8_per_frame(ggml_context * ctx, ggml_tensor * x, RowMax row_max) {
+    const int     k    = static_cast<int>(x->ne[0]);
+    // Per-row max|x|, ne = [1, ...]: |x| gathered at its top_k / argmax index
+    // (see RowMax; a row-wide max-pool runs one thread per row).
+    ggml_tensor * ax   = ggml_abs(ctx, x);
+    const int64_t rows = ggml_nrows(x);
+    ggml_tensor * imax =
+        row_max == RowMax::ArgMax ? ggml_argmax(ctx, ggml_reshape_2d(ctx, ax, k, rows)) : ggml_top_k(ctx, ax, 1);
+    imax                        = ggml_reshape_2d(ctx, imax, 1, rows);
+    ggml_tensor * amax          = ggml_get_rows(ctx, ggml_reshape_3d(ctx, ax, 1, k, rows), imax);
+    amax                        = ggml_reshape_4d(ctx, amax, 1, x->ne[1], x->ne[2], x->ne[3]);
+    // s = max(amax / 127, 1e-30). A true division (not a scale by 1/127),
+    // as the training quantizer computes it.
+    ggml_tensor *   qmax        = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 127.0f);
+    ggml_tensor *   s           = ggml_clamp(ctx, ggml_div(ctx, amax, qmax), 1e-30f, FLT_MAX);
+    // q = round-half-even(x / s). |x / s| <= 127 (plus division rounding),
+    // so adding and subtracting 1.5 * 2^23 rounds to an integer exactly.
+    constexpr float kRoundMagic = 12582912.0f;
+    ggml_tensor *   q           = ggml_div(ctx, x, s);
+    q                           = ggml_scale_bias(ctx, q, 1.0f, kRoundMagic);
+    q                           = ggml_scale_bias(ctx, q, 1.0f, -kRoundMagic);
+    return ggml_mul(ctx, q, s);
+}
+
+ggml_tensor * quant_input(ggml_context * ctx, ggml_tensor * x, const InputQuantParams & iq) {
+    return iq.mode == InputQuant::Int8PerFrame ? fake_quant_int8_per_frame(ctx, x, iq.row_max) : x;
+}
+
 // FeedForward: y = Linear2(SiLU(Linear1(x))). Weights stored
 // ff*_lin1_w ne=[d_model, d_ff], ff*_lin2_w ne=[d_ff, d_model]. Biases
 // [d_out] broadcast along T and B; either or both may be null.
-ggml_tensor * feed_forward(ggml_context * ctx,
-                           ggml_tensor *  x,
-                           ggml_tensor *  lin1_w,
-                           ggml_tensor *  lin1_b,
-                           ggml_tensor *  lin2_w,
-                           ggml_tensor *  lin2_b) {
-    ggml_tensor * y = ggml_mul_mat(ctx, lin1_w, x);
+ggml_tensor * feed_forward(ggml_context *           ctx,
+                           ggml_tensor *            x,
+                           ggml_tensor *            lin1_w,
+                           ggml_tensor *            lin1_b,
+                           ggml_tensor *            lin2_w,
+                           ggml_tensor *            lin2_b,
+                           const InputQuantParams & input_quant) {
+    ggml_tensor * y = ggml_mul_mat(ctx, lin1_w, quant_input(ctx, x, input_quant));
     if (lin1_b != nullptr) {
         y = ggml_add(ctx, y, lin1_b);
     }
     y = ggml_silu(ctx, y);
-    y = ggml_mul_mat(ctx, lin2_w, y);
+    y = ggml_mul_mat(ctx, lin2_w, quant_input(ctx, y, input_quant));
     if (lin2_b != nullptr) {
         y = ggml_add(ctx, y, lin2_b);
     }
@@ -64,16 +100,17 @@ ggml_tensor * feed_forward(ggml_context * ctx,
 
 // Macaron half-residual feed-forward: x + 0.5 * FF(LN(x)). The 0.5 scale
 // is the macaron weighting (FF1/FF2); MHSA and conv use a full residual.
-ggml_tensor * macaron_ff_residual(ggml_context * ctx,
-                                  ggml_tensor *  x,
-                                  ggml_tensor *  norm_w,
-                                  ggml_tensor *  norm_b,
-                                  ggml_tensor *  lin1_w,
-                                  ggml_tensor *  lin1_b,
-                                  ggml_tensor *  lin2_w,
-                                  ggml_tensor *  lin2_b) {
+ggml_tensor * macaron_ff_residual(ggml_context *           ctx,
+                                  ggml_tensor *            x,
+                                  ggml_tensor *            norm_w,
+                                  ggml_tensor *            norm_b,
+                                  ggml_tensor *            lin1_w,
+                                  ggml_tensor *            lin1_b,
+                                  ggml_tensor *            lin2_w,
+                                  ggml_tensor *            lin2_b,
+                                  const InputQuantParams & input_quant) {
     ggml_tensor * y = layer_norm(ctx, x, norm_w, norm_b);
-    y               = feed_forward(ctx, y, lin1_w, lin1_b, lin2_w, lin2_b);
+    y               = feed_forward(ctx, y, lin1_w, lin1_b, lin2_w, lin2_b, input_quant);
     y               = ggml_scale(ctx, y, 0.5f);
     return ggml_add(ctx, x, y);
 }
@@ -375,10 +412,14 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     // TRANSCRIBE_CONV_NO_DIRECT_PW (correctness beats the perf override).
     // Likewise for a pointwise kernel im2col cannot take (a pre-quantized
     // one, stored [in, out]): only the direct mul_mat handles it.
-    const bool direct_pw =
-        policy.direct_pw || B > 1 || !pw_kernel_im2col_ok(b.conv_pw1_w) || !pw_kernel_im2col_ok(b.conv_pw2_w);
+    // Input quantization needs a frame per row at both pointwise inputs,
+    // which only the direct path's [d_model, T] layout has.
+    const InputQuantParams & iq        = params.input_quant;
+    const bool               direct_pw = policy.direct_pw || B > 1 || iq.mode != InputQuant::None ||
+                                         !pw_kernel_im2col_ok(b.conv_pw1_w) || !pw_kernel_im2col_ok(b.conv_pw2_w);
 
     if (direct_pw) {
+        x = quant_input(ctx, x, iq);
         // Pointwise conv 1 as direct mul_mat in [d_model, T, B] layout.
         // Kernel ne=[1, d_model, 2*d_model] (or already [d_model, 2*d_model])
         // → reshape to [d_model, 2*d_model].
@@ -538,7 +579,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
         // Pointwise conv 2 as direct mul_mat in [d_model, T] layout. See
         // the pw1 comment above for the F16 / CUDA COMPUTE_16F rationale.
         ggml_tensor * pw2 = ggml_reshape_2d(ctx, b.conv_pw2_w, d_model, d_model);
-        x                 = ggml_mul_mat(ctx, pw2, x);
+        x                 = ggml_mul_mat(ctx, pw2, quant_input(ctx, x, iq));
         if (b.conv_pw2_w->type == GGML_TYPE_F16) {
             ggml_prec_set_acc(x, GGML_PREC_F32);
         }
@@ -633,7 +674,13 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     const int  W_right    = is_local ? att_context_right : 0;
 
     // Q, K, V, P projections. Q/K/V may have bias (Cohere) or not
-    // (Parakeet); the pos projection (attn_pos_w) never has a bias.
+    // (Parakeet); the pos projection (attn_pos_w) never has a bias. Input
+    // quantization is per frame, so a query slice of x quantizes as x does.
+    const InputQuantParams & iq = params.input_quant;
+    x                           = quant_input(ctx, x, iq);
+    if (q_sliced) {
+        x_q = quant_input(ctx, x_q, iq);
+    }
     ggml_tensor * q = ggml_mul_mat(ctx, b.attn_q_w, q_sliced ? x_q : x);
     if (b.attn_q_b != nullptr) {
         q = ggml_add(ctx, q, b.attn_q_b);
@@ -651,7 +698,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
             v = ggml_add(ctx, v, b.attn_v_b);
         }
     }
-    ggml_tensor * p = pos_proj == nullptr ? ggml_mul_mat(ctx, b.attn_pos_w, pos_emb) : nullptr;
+    ggml_tensor * p = pos_proj == nullptr ? ggml_mul_mat(ctx, b.attn_pos_w, quant_input(ctx, pos_emb, iq)) : nullptr;
 
     // Bounded-window attention: every block of C queries attends to a
     // fixed window of W keys (ChunkedLimited: the current chunk plus the
@@ -796,7 +843,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
             o = ggml_view_3d(ctx, o, d_model, T, B, o->nb[1], o->nb[2], 0);
             o = ggml_cont(ctx, o);
         }
-        o = ggml_mul_mat(ctx, b.attn_out_w, o);
+        o = ggml_mul_mat(ctx, b.attn_out_w, quant_input(ctx, o, iq));
         if (b.attn_out_b != nullptr) {
             o = ggml_add(ctx, o, b.attn_out_b);
         }
@@ -974,7 +1021,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     // Collapse heads back to d_model, keeping the batch at ne[2].
     o = ggml_reshape_3d(ctx, o, d_model, T_q, B);
 
-    o = ggml_mul_mat(ctx, b.attn_out_w, o);
+    o = ggml_mul_mat(ctx, b.attn_out_w, quant_input(ctx, o, iq));
     if (b.attn_out_b != nullptr) {
         o = ggml_add(ctx, o, b.attn_out_b);
     }
@@ -999,7 +1046,8 @@ ggml_tensor * build_conformer_block(ggml_context *        ctx,
     };
 
     // Macaron FF1: x = x + 0.5 * FF1(LN_ff1(x))
-    x = macaron_ff_residual(ctx, x, b.norm_ff1_w, b.norm_ff1_b, b.ff1_lin1_w, b.ff1_lin1_b, b.ff1_lin2_w, b.ff1_lin2_b);
+    x = macaron_ff_residual(ctx, x, b.norm_ff1_w, b.norm_ff1_b, b.ff1_lin1_w, b.ff1_lin1_b, b.ff1_lin2_w, b.ff1_lin2_b,
+                            params.input_quant);
     notify("after_ff1", x);
 
     // Self-attention with relative position. Full residual.
@@ -1078,11 +1126,12 @@ ggml_tensor * build_conformer_block(ggml_context *        ctx,
         if (kv_mode) {
             // Project K/V for the new frames only, prepend the cached
             // window, and rotate the cache forward.
-            ggml_tensor * k_new = ggml_mul_mat(ctx, b.attn_k_w, x_norm);
+            ggml_tensor * kv_in = quant_input(ctx, x_norm, params.input_quant);
+            ggml_tensor * k_new = ggml_mul_mat(ctx, b.attn_k_w, kv_in);
             if (b.attn_k_b != nullptr) {
                 k_new = ggml_add(ctx, k_new, b.attn_k_b);
             }
-            ggml_tensor * v_new = ggml_mul_mat(ctx, b.attn_v_w, x_norm);
+            ggml_tensor * v_new = ggml_mul_mat(ctx, b.attn_v_w, kv_in);
             if (b.attn_v_b != nullptr) {
                 v_new = ggml_add(ctx, v_new, b.attn_v_b);
             }
@@ -1119,7 +1168,8 @@ ggml_tensor * build_conformer_block(ggml_context *        ctx,
     notify("after_conv", x);
 
     // Macaron FF2.
-    x = macaron_ff_residual(ctx, x, b.norm_ff2_w, b.norm_ff2_b, b.ff2_lin1_w, b.ff2_lin1_b, b.ff2_lin2_w, b.ff2_lin2_b);
+    x = macaron_ff_residual(ctx, x, b.norm_ff2_w, b.norm_ff2_b, b.ff2_lin1_w, b.ff2_lin1_b, b.ff2_lin2_w, b.ff2_lin2_b,
+                            params.input_quant);
     notify("after_ff2", x);
 
     // Final per-block LayerNorm.
