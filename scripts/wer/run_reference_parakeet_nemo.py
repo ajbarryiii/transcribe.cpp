@@ -135,8 +135,10 @@ def main() -> int:
     # preserve their native chunked_limited style to score correct WER.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from dump_reference_parakeet_nemo import (
+        _binary_view,
         _patch_conformer_for_offline,
         apply_att_context_right_override,
+        load_binary_view,
         is_prompt_aware,
         resolve_prompt_id,
         apply_prompt,
@@ -166,28 +168,32 @@ def main() -> int:
         print(f"resolved {args.model} -> {local}")
     is_local = local.exists()
     loader = "restore_from" if is_local else "from_pretrained"
-    try:
-        if is_local:
-            model = ASRModel.restore_from(str(local), map_location="cpu")
-        else:
-            model = ASRModel.from_pretrained(args.model, map_location="cpu")
-    except TypeError as e:
-        if "abstract class" not in str(e):
-            raise
-        from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-        from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
-        last = e
-        for cls in (EncDecRNNTBPEModel, EncDecCTCModelBPE):
-            try:
-                if is_local:
-                    model = cls.restore_from(str(local), map_location="cpu")
-                else:
-                    model = cls.from_pretrained(args.model, map_location="cpu")
-                break
-            except Exception as e2:
-                last = e2
-        else:
-            raise last
+    if _binary_view.is_binary_view(local):
+        loader = "binary_view"
+        model = load_binary_view(local)
+    else:
+        try:
+            if is_local:
+                model = ASRModel.restore_from(str(local), map_location="cpu")
+            else:
+                model = ASRModel.from_pretrained(args.model, map_location="cpu")
+        except TypeError as e:
+            if "abstract class" not in str(e):
+                raise
+            from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+            from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
+            last = e
+            for cls in (EncDecRNNTBPEModel, EncDecCTCModelBPE):
+                try:
+                    if is_local:
+                        model = cls.restore_from(str(local), map_location="cpu")
+                    else:
+                        model = cls.from_pretrained(args.model, map_location="cpu")
+                    break
+                except Exception as e2:
+                    last = e2
+            else:
+                raise last
     model.eval()
     apply_att_context_right_override(model, args.att_context_right)
     if att_context is not None:
