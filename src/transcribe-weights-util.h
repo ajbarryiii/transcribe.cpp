@@ -42,6 +42,11 @@
 // adding a preset to transcribe-quantize doesn't silently bypass a
 // family's loader validation.
 //
+// Q1_0 (1-bit sign + one fp16 scale per 128 weights) is the one linear type
+// transcribe-quantize does not emit: it is accepted for GGUFs converted from
+// natively binarized checkpoints, where the weights already are +-scale.
+// Quantizing a float model down to it is not a supported preset.
+//
 // Expanded at macro-use time inside a brace list passed to
 // transcribe::weights::find_tensor(..., allowed_types, ...). Preprocessor
 // expansion (rather than a constexpr array) keeps the existing
@@ -49,7 +54,7 @@
 
 #define TRANSCRIBE_QUANT_LINEAR_TYPES                                                                             \
     GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, \
-        GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K
+        GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q1_0
 
 #define TRANSCRIBE_QUANT_CONV_TYPES GGML_TYPE_F32, GGML_TYPE_F16
 

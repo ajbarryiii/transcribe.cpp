@@ -390,6 +390,23 @@ add_test(NAME transcribe_pack_gate_up_unit
     COMMAND transcribe_pack_gate_up_unit)
 
 # -----------------------------------------------------------------------------
+# Pre-quantized Q1_0 weights: loader allowlist + mul_mat parity, no model needed
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_quant_q1_0_unit
+    quant_q1_0_unit.cpp)
+
+target_link_libraries(transcribe_quant_q1_0_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_quant_q1_0_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_quant_q1_0_unit)
+
+add_test(NAME transcribe_quant_q1_0_unit
+    COMMAND transcribe_quant_q1_0_unit)
+
+# -----------------------------------------------------------------------------
 # Dispatcher-level transcribe_run behavior
 # -----------------------------------------------------------------------------
 
