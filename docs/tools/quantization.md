@@ -178,11 +178,17 @@ negligible size savings. Current examples: Whisper `enc.pos_emb.weight` /
 
 Every family's loader (`src/arch/<family>/weights.cpp`) declares which
 ggml types it will accept for each bucket. Post-unification, these are
-shared constants:
+shared macros in `src/transcribe-weights-util.h`:
 
-- `transcribe::weights::kQuantLinearTypes` — F32, F16, BF16, Q4_0/1,
-  Q5_0/1, Q8_0, Q4_K, Q5_K, Q6_K.
-- `transcribe::weights::kQuantConvTypes` — F32, F16.
+- `TRANSCRIBE_QUANT_LINEAR_TYPES` — F32, F16, BF16, Q4_0/1, Q5_0/1,
+  Q8_0, Q4_K, Q5_K, Q6_K, Q1_0.
+- `TRANSCRIBE_QUANT_CONV_TYPES` — F32, F16.
+
+Q1_0 (one sign bit per weight, one F16 scale per 128-weight block) is
+accepted for GGUFs converted from natively binarized checkpoints, whose
+weights are already `+-scale`. It is not a `transcribe-quantize` preset:
+rounding a float model to 1 bit destroys it, so there is no `Q1_0`
+entry in the preset table above.
 
 Every family must accept the full allowlist. A family that can't (e.g.
 because a specific op is missing on a backend) is a bug, not a policy
