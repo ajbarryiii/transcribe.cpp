@@ -59,6 +59,11 @@ _spec.loader.exec_module(_ref_dump)
 write_tensor = _ref_dump.write_tensor
 write_transcript = _ref_dump.write_transcript
 
+_spec = _importlib_util.spec_from_file_location(
+    "transcribe_binary_view", Path(__file__).resolve().parent / "lib" / "binary_view.py")
+_binary_view = _importlib_util.module_from_spec(_spec)
+_spec.loader.exec_module(_binary_view)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -198,6 +203,28 @@ def _patch_conformer_for_offline(force_regular_att_style: bool = False) -> None:
     ce.ConformerEncoder._transcribe_offline_patched = True
 
 
+def load_binary_view(root: Path):
+    """Rebuild a parakeet-binary-v1 export (binary-weight Parakeet, e.g.
+    kea-b-0.1) as an FP32 NeMo model with dequantized weights, as its
+    exporter loads it. lib/binary_view.py decodes the weights."""
+    import torch
+    from nemo.collections.asr.models import EncDecRNNTBPEModel
+    from omegaconf import OmegaConf, open_dict
+
+    manifest, state = _binary_view.read_binary_view(root)
+    cfg = OmegaConf.create(manifest["config"])
+    with open_dict(cfg):
+        cfg.tokenizer.dir = str(root / "tokenizer")
+        for key, filename in _binary_view.TOKENIZER_FILES.items():
+            cfg.tokenizer[key] = str(root / "tokenizer" / filename)
+        for ds in ("train_ds", "validation_ds", "test_ds"):
+            if ds in cfg:
+                cfg[ds] = None
+    model = EncDecRNNTBPEModel(cfg=cfg)
+    model.load_state_dict({k: torch.from_numpy(v) for k, v in state.items()}, strict=True)
+    return model.to(dtype=torch.float32)
+
+
 def load_model(args: argparse.Namespace):
     """Load a Parakeet model via NeMo. Architecture is inferred at runtime."""
     _patch_conformer_for_offline(force_regular_att_style=bool(getattr(args, "offline_only", False)))
@@ -207,7 +234,10 @@ def load_model(args: argparse.Namespace):
     model_id = args.model
     local = Path(model_id).expanduser()
 
-    if local.exists():
+    if _binary_view.is_binary_view(local):
+        print(f"Loading binary Parakeet export: {local}")
+        model = load_binary_view(local)
+    elif local.exists():
         print(f"Loading Parakeet from local path: {local}")
         try:
             model = ASRModel.restore_from(str(local), map_location="cpu")
@@ -1525,7 +1555,8 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--model",
         required=True,
-        help="HF model name (e.g. nvidia/parakeet-tdt-0.6b-v2) or local .nemo path",
+        help="HF model name (e.g. nvidia/parakeet-tdt-0.6b-v2), local .nemo path, "
+             "or parakeet-binary-v1 export directory",
     )
     p.add_argument("--audio", required=True, help="16 kHz mono wav file")
     p.add_argument("--out", required=True, help="Output directory")
