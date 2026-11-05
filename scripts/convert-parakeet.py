@@ -68,6 +68,13 @@ transcribe::parakeet::read_parakeet_hparams):
 
 parakeet-ultra uses HF safetensors (no .nemo); Phonon-2 uses Fermion's
 packed container, expanded to F32. Both reuse the HF-to-NeMo name mapping.
+
+kea-b-0.1 reads a local keab-8bit-v1 bundle directory (lib/keab.py) and
+writes an all-F32 GGUF by default, or with --keab-weights q1_0 its binary
+weights as ggml Q1_0 and its int8 weights as Q8_0 (--keab-int8 f16 for F16):
+
+    uv run --project scripts/envs/parakeet scripts/convert-parakeet.py \
+      BUNDLE_DIR models/kea-b-0.1/kea-b-0.1-Q1_0.gguf --keab-weights q1_0
 """
 
 from __future__ import annotations
@@ -75,6 +82,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +112,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 REFERENCE_DTYPE_LABEL = "F32"
 REFERENCE_FILE_TYPE = LlamaFileType.ALL_F32
+
+# Raw ggml type ids written by the kea-b Q1_0 path (see lib/keab.py).
+_TYPE_LABELS = {8: "Q8_0", 41: "Q1_0", "float32": "F32", "float16": "F16"}
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +449,26 @@ VARIANT_PROFILES: dict[str, dict] = {
         "license": "other",
         "license_name": "nvidia-open-model-license",
         "license_link": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/",
+    },
+    # Binary-weight fine-tune of parakeet-tdt-0.6b-v2 from a local
+    # keab-8bit-v1 export bundle (see load_keab_bundle()). The 264
+    # encoder projections are 1-bit with a per-row fp16 scale; the
+    # predictor, joint and pre_encode.out are per-row int8.
+    "kea-b-0.1": {
+        "variant": "tdt-0.6b-kea-b-0.1",
+        "display_name": "Kea-B 0.1",
+        "version": "v0.1",
+        "size_label": "0.6B",
+        "head_kind": "tdt",
+        "expected_vocab_size": 1024,
+        "languages": ["en"],
+        "lang_detect": False,
+        "source_format": "keab_bundle",
+        "author": "Wilderness Labs",
+        "organization": "wilderness-labs",
+        "license": "cc-by-4.0",
+        "license_name": "Creative Commons Attribution 4.0",
+        "license_link": "https://creativecommons.org/licenses/by/4.0/",
     },
     # Post-trained parakeet-tdt-0.6b-v3 plus a `vad_head`. HF safetensors
     # only (F16 at rest, upcast to F32); see load_hf_safetensors_model().
@@ -879,6 +910,46 @@ def load_fermion_model(model_spec: str, revision: str | None) -> _HfSafetensorsM
     if blank_id != 8192 or sp.vocab_size() != blank_id:
         raise ValueError("Phonon-2 requires the v3 8192-piece tokenizer")
     return _HfSafetensorsModel(cfg, sd, extract_tokenizer(sp))
+
+
+def load_keab_bundle(model_spec: str, weights: str, int8_type: str) -> _HfSafetensorsModel:
+    """Load a local keab-8bit-v1 bundle directory (lib/keab.py verifies
+    it). The state_dict is the dequantized F32 model, which drives the
+    hparam reads and the `weights="f32"` output. With `weights="q1_0"`,
+    `.packed` maps the binary weights to Q1_0 rows and the int8 weights
+    to Q8_0 rows or F16 W8 (`int8_type`); add() writes those as is.
+    Binary pointwise convs become 2-D [out, in] in that mode, since a
+    Q1_0 row cannot be the Conv1d layout's 1-element kernel axis."""
+    import sentencepiece as spm
+    import torch
+    from lib import keab
+
+    root = Path(model_spec).expanduser()
+    if not root.is_dir():
+        raise ValueError(f"kea-b source must be a bundle directory, got {model_spec!r}")
+    print(f"Loading kea-b bundle: {root}")
+    bundle = keab.read_bundle(root)
+    sd = {k: torch.from_numpy(v) for k, v in bundle.dequantized_state_dict().items()}
+    sp = spm.SentencePieceProcessor()
+    sp.Load(str(bundle.tokenizer_model))
+    model = _HfSafetensorsModel(bundle.config, sd, extract_tokenizer(sp))
+
+    # nemo name -> (payload, raw ggml type or None, element shape or None)
+    packed: dict[str, tuple[np.ndarray, int | None, tuple[int, ...] | None]] = {}
+    if weights == "q1_0":
+        for name, layer in bundle.binary.items():
+            packed[f"{name}.weight"] = (keab.q1_0_bytes(layer), keab.GGML_TYPE_Q1_0, layer.shape)
+        for name, t in bundle.int8.items():
+            if int8_type == "q8_0":
+                packed[name] = (keab.q8_0_bytes(t), keab.GGML_TYPE_Q8_0, tuple(t.q.shape))
+            else:
+                packed[name] = (t.dequantize().astype(np.float16), None, None)
+    elif weights != "f32":
+        raise ValueError(f"unknown kea-b weights mode {weights!r}")
+    model.packed = packed
+    print(f"  {len(bundle.binary)} binary layers, {len(bundle.int8)} int8 tensors, "
+          f"weights={weights}" + (f", int8={int8_type}" if weights == "q1_0" else ""))
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -1621,10 +1692,9 @@ def tensor_to_fp32_numpy(t) -> np.ndarray:
 
 
 def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
-            revision: str | None = None) -> None:
+            revision: str | None = None, keab_weights: str = "f32",
+            keab_int8: str = "q8_0") -> None:
     from omegaconf import OmegaConf
-
-    print(f"Output dtype: {REFERENCE_DTYPE_LABEL} (source/reference dtype)")
 
     # The output slug is the canonical variant key. main() always sets
     # out_path = models/<slug>/<slug>-<REFDTYPE>.gguf, so the slug is
@@ -1652,10 +1722,20 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
           f"{', spk_kernels=on' if has_spk_kernels else ''})")
 
     has_vad_head = bool(profile.get("has_vad_head", False))
+    is_keab = profile.get("source_format") == "keab_bundle"
+    if not is_keab and (keab_weights != "f32" or keab_int8 != "q8_0"):
+        raise ValueError("--keab-weights / --keab-int8 apply only to kea-b bundle variants")
+    if is_keab and keab_weights == "q1_0":
+        print("Output dtype: Q1_0 binary weights, "
+              f"{keab_int8.upper()} int8 weights, F32 elsewhere")
+    else:
+        print(f"Output dtype: {REFERENCE_DTYPE_LABEL} (source/reference dtype)")
     if profile.get("source_format") == "fermion":
         model = load_fermion_model(model_spec, revision)
     elif profile.get("source_format") == "hf_safetensors":
         model = load_hf_safetensors_model(model_spec, revision or profile.get("hf_revision"))
+    elif is_keab:
+        model = load_keab_bundle(model_spec, keab_weights, keab_int8)
     else:
         model = load_nemo_model(model_spec, prefer_direct=prefer_direct)
 
@@ -1758,6 +1838,7 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
 
     sd = model.state_dict()
     sd_keys = set(sd.keys())
+    packed = getattr(model, "packed", None) or {}
 
     # Resolve enc_use_bias from the state_dict. The presence of
     # encoder.layers.0.feed_forward1.linear1.bias is authoritative; the
@@ -1787,7 +1868,9 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
         basename=profile.get("basename", "parakeet-tdt"),
         size_label=profile["size_label"],
         version=profile["version"],
-        file_type=REFERENCE_FILE_TYPE,
+        # A Q1_0 / Q8_0 / F32 mix has no llama file type; GUESSED is
+        # llama.cpp's "not specified" value.
+        file_type=(LlamaFileType.GUESSED if packed else REFERENCE_FILE_TYPE),
         languages=profile["languages"],
         author=profile.get("author", "NVIDIA"),
         organization=profile.get("organization", "nvidia"),
@@ -2059,13 +2142,26 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
     consumed: set[str] = set()
     n_added = 0
     bytes_out = 0
+    type_counts: Counter = Counter()
 
     def add(nemo_name: str, gguf_name: str) -> None:
         nonlocal n_added, bytes_out
         if nemo_name not in sd_keys:
             raise KeyError(f"state_dict missing tensor: {nemo_name!r}")
-        arr = tensor_to_fp32_numpy(sd[nemo_name])
-        writer.add_tensor(gguf_name, arr)
+        if nemo_name in packed:
+            arr, raw_type, raw_shape = packed[nemo_name]
+            if raw_type is None:
+                writer.add_tensor(gguf_name, arr)
+            else:
+                # Raw ggml blocks. An int8 view keeps gguf-py from mapping
+                # the byte shape through its block table, which lacks Q1_0.
+                writer.add_tensor(gguf_name, arr.view(np.int8),
+                                  raw_shape=raw_shape, raw_dtype=raw_type)
+            type_counts[raw_type if raw_type is not None else str(arr.dtype)] += 1
+        else:
+            arr = tensor_to_fp32_numpy(sd[nemo_name])
+            writer.add_tensor(gguf_name, arr)
+            type_counts["float32"] += 1
         consumed.add(nemo_name)
         bytes_out += int(arr.nbytes)
         n_added += 1
@@ -2087,6 +2183,7 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
             )
         arr = np.ascontiguousarray(a + b)
         writer.add_tensor(gguf_name, arr)
+        type_counts["float32"] += 1
         consumed.add(nemo_a)
         consumed.add(nemo_b)
         bytes_out += int(arr.nbytes)
@@ -2202,7 +2299,10 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
         raise RuntimeError(
             f"tensor count mismatch: added {n_added}, expected {expected}"
         )
-    print(f"Added {n_added} tensors ({bytes_out / (1024 * 1024):.1f} MB)")
+    if packed and len(consumed & packed.keys()) != len(packed):
+        raise RuntimeError(f"packed tensors not written: {sorted(packed.keys() - consumed)[:5]}")
+    print(f"Added {n_added} tensors ({bytes_out / (1024 * 1024):.1f} MB): "
+          + ", ".join(f"{_TYPE_LABELS.get(k, k)} {n}" for k, n in sorted(type_counts.items(), key=str)))
 
     unused = sorted(
         k for k in (sd_keys - consumed)
@@ -2259,6 +2359,21 @@ def main(argv: list[str]) -> int:
         help="HF revision for HF-safetensors or Fermion variants; "
              "defaults to the profile's pinned revision.",
     )
+    p.add_argument(
+        "--keab-weights",
+        choices=("f32", "q1_0"),
+        default="f32",
+        help="kea-b bundles only: f32 dequantizes every weight; q1_0 "
+             "keeps the binary weights as ggml Q1_0 and the int8 weights "
+             "as --keab-int8.",
+    )
+    p.add_argument(
+        "--keab-int8",
+        choices=("q8_0", "f16"),
+        default="q8_0",
+        help="kea-b with --keab-weights q1_0: store the int8 weights as "
+             "Q8_0 (codes with d = fp16(scale)) or as F16 W8 = fp16(q * s).",
+    )
     args = p.parse_args(argv[1:])
 
     out_path = args.out_path
@@ -2273,13 +2388,15 @@ def main(argv: list[str]) -> int:
             )
             return 2
         slug = slug_from_repo_id(repo_id)
-        out_path = REPO_ROOT / "models" / slug / gguf_name(slug, REFERENCE_DTYPE_LABEL)
+        label = "Q1_0" if args.keab_weights == "q1_0" else REFERENCE_DTYPE_LABEL
+        out_path = REPO_ROOT / "models" / slug / gguf_name(slug, label)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
     repo_id = args.repo_id
     if repo_id is None and "/" in args.model and not Path(args.model).exists():
         repo_id = args.model
-    convert(args.model, out_path, repo_id=repo_id, revision=args.revision)
+    convert(args.model, out_path, repo_id=repo_id, revision=args.revision,
+            keab_weights=args.keab_weights, keab_int8=args.keab_int8)
     return 0
 
 
