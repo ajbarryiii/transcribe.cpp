@@ -337,12 +337,18 @@ bool detect_direct_pw(const char * backend) {
     return resolve_conv_direct("TRANSCRIBE_CONV_DIRECT_PW", "TRANSCRIBE_CONV_NO_DIRECT_PW", backend_default);
 }
 
+// The im2col pointwise fallback hands the kernel to ggml_im2col, which only
+// takes F32/F16 kernels in the conv layout [1, in, out].
+static bool pw_kernel_im2col_ok(const ggml_tensor * w) {
+    return w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16;
+}
+
 // Conv module (pointwise -> GLU -> depthwise -> BN/LN -> SiLU -> pointwise).
 // Operates on the post-LayerNorm activation (LN applied by the caller).
 // Pointwise convs (k=1) are direct mul_mats in [d_model, T] layout by
 // default; TRANSCRIBE_CONV_NO_DIRECT_PW=1 forces the im2col path for
-// single-utterance runs. BatchNorm uses fused scale + bias; LayerNorm
-// normalizes per-channel on the fly.
+// single-utterance runs with F32/F16 pointwise kernels. BatchNorm uses fused
+// scale + bias; LayerNorm normalizes per-channel on the fly.
 ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView & b, const BlockParams & params) {
     const int          conv_kernel = params.conv_kernel;
     const ConvPolicy & policy      = params.policy;
@@ -367,11 +373,15 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     // conv_pad_mask no longer broadcasts and ggml aborts. Force the
     // batch-aware direct path at B > 1 regardless of backend policy or
     // TRANSCRIBE_CONV_NO_DIRECT_PW (correctness beats the perf override).
-    const bool direct_pw = policy.direct_pw || B > 1;
+    // Likewise for a pointwise kernel im2col cannot take (a pre-quantized
+    // one, stored [in, out]): only the direct mul_mat handles it.
+    const bool direct_pw =
+        policy.direct_pw || B > 1 || !pw_kernel_im2col_ok(b.conv_pw1_w) || !pw_kernel_im2col_ok(b.conv_pw2_w);
 
     if (direct_pw) {
         // Pointwise conv 1 as direct mul_mat in [d_model, T, B] layout.
-        // Kernel ne=[1, d_model, 2*d_model] → reshape to [d_model, 2*d_model].
+        // Kernel ne=[1, d_model, 2*d_model] (or already [d_model, 2*d_model])
+        // → reshape to [d_model, 2*d_model].
         // Force F32 accumulation for F16 weights (see mul_mat_f32acc in
         // causal_lm.cpp for the CUDA COMPUTE_16F saturation rationale).
         {

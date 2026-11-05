@@ -600,6 +600,8 @@ set(TRANSCRIBE_FIXTURE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_minimal.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_q8_0.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_q8_0_as_f16.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/parakeet_q1_0_as_f32.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_hop0.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_win_gt_fft.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_silero_vad.gguf
@@ -822,6 +824,29 @@ if(TRANSCRIBE_UV)
     add_test(NAME transcribe_parakeet_smoke COMMAND transcribe_parakeet_smoke)
     set_tests_properties(transcribe_parakeet_smoke PROPERTIES
         SKIP_RETURN_CODE 77)
+endif()
+
+# -----------------------------------------------------------------------------
+# Parakeet with pre-quantized Q1_0 encoder weights
+# -----------------------------------------------------------------------------
+
+if(TRANSCRIBE_UV)
+    add_executable(transcribe_parakeet_q1_0_smoke
+        parakeet_q1_0_smoke.cpp)
+
+    target_link_libraries(transcribe_parakeet_q1_0_smoke PRIVATE transcribe ggml)
+
+    target_include_directories(transcribe_parakeet_q1_0_smoke PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+
+    target_compile_definitions(transcribe_parakeet_q1_0_smoke PRIVATE
+        "TRANSCRIBE_TEST_FIXTURES_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\"")
+
+    transcribe_apply_warnings(transcribe_parakeet_q1_0_smoke)
+
+    add_dependencies(transcribe_parakeet_q1_0_smoke fixtures)
+
+    add_test(NAME transcribe_parakeet_q1_0_smoke COMMAND transcribe_parakeet_q1_0_smoke)
 endif()
 
 # -----------------------------------------------------------------------------
