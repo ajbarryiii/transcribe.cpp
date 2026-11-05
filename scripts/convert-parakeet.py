@@ -470,7 +470,16 @@ VARIANT_PROFILES: dict[str, dict] = {
         "lang_detect": False,
         "source_format": "keab_bundle",
         "author": "Wilderness Labs",
-        "organization": "wilderness-labs",
+        "organization": "wildernesslabs",
+        # The bundle is converted from a local path, so the published
+        # model page stands in for --repo-id.
+        "repo_url": "https://huggingface.co/wildernesslabs/kea-b-0.1",
+        "base_models": [
+            {"name": "kea-b", "organization": "Wilderness Labs",
+             "repo_url": "https://huggingface.co/wildernesslabs/kea-b"},
+            {"name": "Parakeet TDT 0.6B v2", "organization": "NVIDIA",
+             "repo_url": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2"},
+        ],
         "license": "cc-by-4.0",
         "license_name": "Creative Commons Attribution 4.0",
         "license_link": "https://creativecommons.org/licenses/by/4.0/",
@@ -1898,7 +1907,8 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
         license=profile["license"],
         license_name=profile["license_name"],
         license_link=profile["license_link"],
-        repo_url=(f"https://huggingface.co/{repo_id}" if repo_id else None),
+        repo_url=(f"https://huggingface.co/{repo_id}" if repo_id else profile.get("repo_url")),
+        base_models=profile.get("base_models"),
     )
 
     # ----- stt.variant + capability KV -----
