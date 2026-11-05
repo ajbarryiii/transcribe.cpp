@@ -527,6 +527,23 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
         hp.tdt_global_symbol_budget = (budget == "global");
     }
 
+    // Projection-input quantization. Optional; absent keeps float inputs.
+    {
+        std::string input_quant;
+        if (auto st =
+                read_optional_string_kv(gguf, "stt.parakeet.encoder.input_quant", kFamilyTag, "none", input_quant);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (input_quant != "none" && input_quant != "int8_per_frame") {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet: unsupported encoder.input_quant \"%s\" (allowed: none, int8_per_frame)",
+                    input_quant.c_str());
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        hp.enc_input_quant_int8 = (input_quant == "int8_per_frame");
+    }
+
     // Long-form attention window. A full-attention GGUF (Regular,
     // att_context (-1, -1)) runs NeMo's rel_pos_local_attn window
     // [256, 256] by default: the same post-hoc switch as

@@ -185,6 +185,13 @@ struct ParakeetHParams {
     // the pointwise bias on padded frames before the next strided conv.
     bool mask_after_pointwise   = false;
 
+    // enc_input_quant_int8: fake-quantize the input of every conformer block
+    // projection per frame to INT8 (conformer::InputQuant::Int8PerFrame), as
+    // checkpoints trained with quantized activations (kea-b) run. KV
+    // stt.parakeet.encoder.input_quant = "int8_per_frame"; absent / "none"
+    // keeps float inputs.
+    bool enc_input_quant_int8 = false;
+
     // Speech head on the subsampler output and the long-form pause
     // segmenter it drives. has_vad_head is set when stt.parakeet.vad.hidden
     // is present.

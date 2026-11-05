@@ -10,6 +10,7 @@
 // run() computes the mel front-end, runs the encoder graph, then
 // host-decodes (predictor + joint + TDT).
 
+#include "conformer/conformer.h"
 #include "decoder.h"
 #include "encoder.h"
 #include "ggml-alloc.h"
@@ -908,7 +909,7 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     }
     // RNN-T models bias inside the decoder (decode_rnnt_tree); TDT models
     // rescore the greedy transcript afterwards.
-    const bool tree_mode = vocabulary.active() && pm->host_decoder.head_kind == HostHeadKind::RNNT;
+    const bool  tree_mode = vocabulary.active() && pm->host_decoder.head_kind == HostHeadKind::RNNT;
     TreeOptions tree_options;
     tree_options.skeleton_boost = vocabulary.boost;
     tree_options.boost          = vocabulary.boost * k_tree_boost_ratio;
@@ -2421,8 +2422,14 @@ transcribe_status ensure_pos_proj_cache(ParakeetSession * pc, ParakeetModel * pm
     ggml_tensor * pos_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, pos_len);
     ggml_set_name(pos_in, "pos_proj.pos_emb.in");
     ggml_set_input(pos_in);
+    // The memoized projection must equal rel_pos_mhsa's, input quantization
+    // included.
+    ggml_tensor * pos_q =
+        pm->hparams.enc_input_quant_int8 ?
+            conformer::fake_quant_int8_per_frame(gctx, pos_in, conformer::row_max_for_backend(pm->backend.c_str())) :
+            pos_in;
     for (int i = 0; i < n_layers; ++i) {
-        ggml_tensor * p   = ggml_mul_mat(gctx, pm->weights.blocks[static_cast<size_t>(i)].attn_pos_w, pos_in);
+        ggml_tensor * p   = ggml_mul_mat(gctx, pm->weights.blocks[static_cast<size_t>(i)].attn_pos_w, pos_q);
         p                 = ggml_reshape_4d(gctx, p, head_dim, n_head, pos_len, 1);
         p                 = ggml_cont(gctx, ggml_permute(gctx, p, 0, 2, 1, 3));
         ggml_tensor * cpy = ggml_cpy(gctx, p, sc.pos_proj[static_cast<size_t>(i)]);
