@@ -16,7 +16,8 @@
 //   - Conv2d weights: PyTorch OIHW [out_channels, in_channels, kH, kW].
 //   - Conv1d weights: PyTorch [out_channels, in_channels, kernel] for
 //     pointwise; [out_channels, kernel, 1] for depthwise (groups =
-//     out_channels = in_channels).
+//     out_channels = in_channels). A pointwise kernel that is not
+//     F32/F16 drops the kernel axis: [out_channels, in_channels].
 //   - LSTM gates (Wx, Wh): single concatenated [4*hidden, input] in
 //     PyTorch (i, f, g, o) order; bias concatenated [4*hidden].
 //   - LayerNorm/RMSNorm: separate weight + bias, shape [d_model].
@@ -311,6 +312,8 @@ struct ParakeetBlock {
     // Convolution module: pointwise -> GLU -> depthwise -> BN -> activation -> pointwise.
     ggml_tensor * norm_conv_w = nullptr;  // [d_model]
     ggml_tensor * norm_conv_b = nullptr;  // [d_model]
+    // Pointwise kernels are stored [out, in, 1] when F32/F16 and [out, in]
+    // otherwise (pre-quantized, e.g. Q1_0; see GET_PW in weights.cpp).
     ggml_tensor * conv_pw1_w  = nullptr;  // [2*d_model, d_model, 1]   conv1d k=1; 2x for GLU
     ggml_tensor * conv_pw1_b  = nullptr;  // [2*d_model], nullable (use_bias)
     ggml_tensor * conv_dw_w   = nullptr;  // [d_model,   1,       k]   depthwise conv1d

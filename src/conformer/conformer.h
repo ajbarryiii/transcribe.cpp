@@ -74,6 +74,8 @@ struct BlockView {
     // Convolution module. Pointwise conv1 is 2*d_model for GLU.
     ggml_tensor * norm_conv_w         = nullptr;  // [d_model]
     ggml_tensor * norm_conv_b         = nullptr;  // [d_model]
+    // Pointwise kernels: [1, d_model, out] when F32/F16; any other type
+    // (pre-quantized) is stored [d_model, out] and always runs as a mul_mat.
     ggml_tensor * conv_pw1_w          = nullptr;  // [1, d_model, 2*d_model]
     ggml_tensor * conv_pw1_b          = nullptr;  // [2*d_model], nullable
     ggml_tensor * conv_dw_w           = nullptr;  // [k, 1, d_model]
@@ -140,8 +142,9 @@ struct ConvPolicy {
 bool resolve_conv_direct(const char * direct_env, const char * no_direct_env, bool backend_default);
 
 // Pointwise conv dispatch auto-detect (same answer for every family today).
-// Env overrides: TRANSCRIBE_CONV_NO_DIRECT_PW forces im2col,
-// TRANSCRIBE_CONV_DIRECT_PW forces direct. Vulkan defaults to im2col: on
+// Env overrides: TRANSCRIBE_CONV_NO_DIRECT_PW forces im2col (conv_module still
+// goes direct for B > 1 or a non-F32/F16 kernel), TRANSCRIBE_CONV_DIRECT_PW
+// forces direct. Vulkan defaults to im2col: on
 // AMD Renoir, im2col + mul_mat measured ~200 ms/encode faster than direct for
 // f32 weights. Metal and CPU prefer direct.
 bool detect_direct_pw(const char * backend);
