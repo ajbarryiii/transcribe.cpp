@@ -99,6 +99,14 @@ Fixtures emitted (see emit_fixtures for the full list):
                               enc_dec_proj + N_dec Transformer blocks
                               with self/cross-attention + tied head.
 
+  parakeet_q1_0.gguf       -- the minimal Parakeet model at d_model =
+                              d_ff = 128 with every encoder linear and
+                              both conv-module pointwise kernels in Q1_0
+                              (pointwise stored [in, out]).
+  parakeet_q1_0_as_f32.gguf -- the same weights in F32, decoded, with the
+                              pointwise kernels in the [1, in, out] conv
+                              layout.
+
 Run:
 
     uv run tests/fixtures/make_gguf_fixtures.py [output_dir]
@@ -136,13 +144,16 @@ GGUF_TYPE_ARRAY   = 9
 GGML_TYPE_F32  = 0
 GGML_TYPE_F16  = 1
 GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q1_0 = 41
 
 # (bytes per block, elements per block) for each ggml_type we emit. Q8_0 is
-# 32 int8 quants behind one fp16 scale, blocked along ne[0].
+# 32 int8 quants behind one fp16 scale, blocked along ne[0]. Q1_0 is 128 sign
+# bits (bit j = qs[j // 8] >> (j % 8) & 1; set = +d) behind one fp16 scale d.
 GGML_TYPE_SIZE = {
     GGML_TYPE_F32:  (4, 1),
     GGML_TYPE_F16:  (2, 1),
     GGML_TYPE_Q8_0: (34, 32),
+    GGML_TYPE_Q1_0: (18, 128),
 }
 
 
@@ -463,10 +474,10 @@ PARAKEET_HP = {
 }
 
 
-def _parakeet_hparams_kv() -> list[bytes]:
+def _parakeet_hparams_kv(hp: dict | None = None) -> list[bytes]:
     """KV blobs for the stt.parakeet.* / stt.frontend.* hparams the
     loader's read_parakeet_hparams() requires."""
-    hp = PARAKEET_HP
+    hp = hp or PARAKEET_HP
     return [
         _pack_kv_uint32("stt.parakeet.encoder.n_layers",             hp["enc_n_layers"]),
         _pack_kv_uint32("stt.parakeet.encoder.d_model",              hp["enc_d_model"]),
@@ -529,8 +540,9 @@ def _parakeet_pre_encode_F_prime(n_mels: int, causal: bool = False) -> int:
     return dim
 
 
-def _parakeet_tensor_descriptors(causal_pre_encode: bool = False) -> list[tuple[str, list[int]]]:
-    hp = PARAKEET_HP
+def _parakeet_tensor_descriptors(causal_pre_encode: bool = False,
+                                 hp: dict | None = None) -> list[tuple[str, list[int]]]:
+    hp = hp or PARAKEET_HP
     d_model      = hp["enc_d_model"]
     d_ff         = hp["enc_d_ff"]
     n_heads      = hp["enc_n_heads"]
@@ -635,6 +647,78 @@ def _parakeet_tensors(causal_pre_encode: bool = False) -> list[Tensor]:
         tensors.append(
             Tensor(name, ne, GGML_TYPE_F32, _f32_seq(n_elem, idx))
         )
+    return tensors
+
+
+# Parakeet with 1-bit encoder weights, as converted from a natively binarized
+# checkpoint: every encoder linear and both conv-module pointwise kernels are
+# Q1_0. d_model and d_ff are 128 so each of those rows is one Q1_0 block.
+# Pointwise kernels drop their kernel axis ([1, in, out] -> [in, out]): a
+# block-quantized row cannot have ne[0] == 1. Subsampling (8x, the factor the
+# encoder implements) and the frontend (16 mels, 25 ms window, 10 ms hop) are
+# sized so the model also runs, not only loads.
+PARAKEET_Q1_0_HP = {
+    **PARAKEET_HP,
+    "enc_d_model":            128,
+    "enc_d_ff":               128,
+    "enc_subsampling_factor": 8,
+    "enc_pos_emb_max_len":    64,
+    "fe_num_mels":            16,
+    "fe_n_fft":               512,
+    "fe_win_length":          400,
+    "fe_hop_length":          160,
+}
+
+_PARAKEET_Q1_0_SUFFIXES = (
+    ".ff1.linear1.weight", ".ff1.linear2.weight", ".ff2.linear1.weight", ".ff2.linear2.weight",
+    ".attn.linear_q.weight", ".attn.linear_k.weight", ".attn.linear_v.weight",
+    ".attn.linear_out.weight", ".attn.linear_pos.weight",
+    ".conv.pointwise1.weight", ".conv.pointwise2.weight",
+)
+
+
+def _q1_0_blocks(values: list[float]) -> tuple[bytes, list[float]]:
+    """Pack Q1_0 blocks (scale = mean |x| of the block, sign bit per value)
+    and return the +-d values they decode to (fp16 d, exact in float)."""
+    data = bytearray()
+    deq: list[float] = []
+    for b in range(0, len(values), 128):
+        x = values[b:b + 128]
+        d16 = struct.pack("<e", sum(abs(v) for v in x) / 128.0)
+        d = struct.unpack("<e", d16)[0]
+        qs = bytearray(16)
+        for j, v in enumerate(x):
+            if v >= 0.0:
+                qs[j // 8] |= 1 << (j % 8)
+        data += d16 + bytes(qs)
+        deq += [d if v >= 0.0 else -d for v in x]
+    return bytes(data), deq
+
+
+def _parakeet_q1_0_tensors(as_f32: bool) -> list[Tensor]:
+    """The PARAKEET_Q1_0_HP model with its encoder weights in Q1_0, or
+    (as_f32) the same weights as F32 holding the decoded +-d values, with the
+    pointwise kernels in the usual [1, in, out] conv layout. Values are small
+    and seeded so a forward pass stays well inside float range."""
+    rng = _random.Random(41)
+    tensors: list[Tensor] = []
+    for name, ne in _parakeet_tensor_descriptors(hp=PARAKEET_Q1_0_HP):
+        n_elem = 1
+        for d in ne:
+            n_elem *= d
+        if name.endswith(".running_var"):
+            values = [1.0 + 0.1 * rng.random() for _ in range(n_elem)]
+        else:
+            values = [0.1 * rng.uniform(-1.0, 1.0) for _ in range(n_elem)]
+        if not (name.startswith("enc.blocks.") and name.endswith(_PARAKEET_Q1_0_SUFFIXES)):
+            tensors.append(Tensor(name, ne, GGML_TYPE_F32, _f32_bytes(values)))
+            continue
+        q1, deq = _q1_0_blocks(values)
+        if as_f32:
+            tensors.append(Tensor(name, ne, GGML_TYPE_F32, _f32_bytes(deq)))
+        else:
+            ne_2d = [ne[1], ne[2]] if len(ne) == 3 and ne[0] == 1 else ne
+            tensors.append(Tensor(name, ne_2d, GGML_TYPE_Q1_0, q1))
     return tensors
 
 
@@ -2072,6 +2156,24 @@ def emit_fixtures(out_dir: Path) -> None:
            _ecapa_tdnn_gguf(ECAPA_LABEL_CODES, ECAPA_LABEL_NAMES, ["xx=aa"], q8_0="q8_0"))
     _write(out_dir / "arch_ecapa_tdnn_q8_0_as_f16.gguf",
            _ecapa_tdnn_gguf(ECAPA_LABEL_CODES, ECAPA_LABEL_NAMES, ["xx=aa"], q8_0="as_f16"))
+
+    # Parakeet with Q1_0 encoder linears and pointwise kernels (the latter in
+    # the [in, out] layout), and the same model in F32 with the decoded
+    # weights and [1, in, out] pointwise kernels.
+    for suffix, as_f32 in (("", False), ("_as_f32", True)):
+        _write(
+            out_dir / f"parakeet_q1_0{suffix}.gguf",
+            _build_full_gguf(
+                GGUF_MAGIC,
+                [
+                    _pack_kv_string("general.architecture", "parakeet"),
+                    _pack_kv_string("stt.variant", "tdt-0.6b-v2"),
+                    *tokenizer_kv,
+                    *_parakeet_hparams_kv(PARAKEET_Q1_0_HP),
+                ],
+                _parakeet_q1_0_tensors(as_f32),
+            ),
+        )
     # Front ends the loader must reject: a zero hop divides by zero in the
     # frame count, and win_length > n_fft overruns the padded window.
     _write(out_dir / "arch_ecapa_tdnn_bad_hop0.gguf",

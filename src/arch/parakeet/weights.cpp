@@ -830,6 +830,9 @@ using transcribe::weights::lname;
 //   GET_LIN  - mul_mat linear weights (TRANSCRIBE_QUANT_LINEAR_TYPES;
 //              every family accepts the same set so a quantize preset
 //              never produces a tensor the loader refuses).
+//   GET_PW   - conformer 1x1 pointwise kernels: GET_CONV in the conv layout
+//              [1, in, out] when F32/F16, otherwise GET_LIN in the linear
+//              layout [in, out] (see the macro).
 constexpr const char * kTag = kFamilyTag;
 
 #define GET_F32(slot, name, ...)                                                                          \
@@ -857,6 +860,22 @@ constexpr const char * kTag = kFamilyTag;
         if (_t == nullptr)                                                                                       \
             return TRANSCRIBE_ERR_GGUF;                                                                          \
         (slot) = _t;                                                                                             \
+    } while (0)
+
+// A pre-quantized pointwise kernel (e.g. Q1_0 from a natively binarized
+// checkpoint) cannot use the conv layout: block-quantized rows need ne[0] to
+// be a multiple of the block size, and [1, in, out] has ne[0] == 1. Such
+// kernels are stored [in, out], which holds the same elements in the same
+// order; conformer::conv_module always runs them as a direct mul_mat.
+#define GET_PW(slot, name, in, out)                                                       \
+    do {                                                                                  \
+        const char *        _pw_name = (name);                                            \
+        const ggml_tensor * _pw      = ggml_get_tensor(ctx_meta, _pw_name);               \
+        if (_pw != nullptr && _pw->type != GGML_TYPE_F32 && _pw->type != GGML_TYPE_F16) { \
+            GET_LIN(slot, _pw_name, (in), (out));                                         \
+        } else {                                                                          \
+            GET_CONV(slot, _pw_name, 1, (in), (out));                                     \
+        }                                                                                 \
     } while (0)
 
 }  // namespace
@@ -949,9 +968,9 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
         // back to d_model.
         GET_F32(b.norm_conv_w, lname("enc.blocks.%d.norm_conv.weight", i), d_model);
         GET_F32(b.norm_conv_b, lname("enc.blocks.%d.norm_conv.bias", i), d_model);
-        GET_CONV(b.conv_pw1_w, lname("enc.blocks.%d.conv.pointwise1.weight", i), 1, d_model, 2 * d_model);
+        GET_PW(b.conv_pw1_w, lname("enc.blocks.%d.conv.pointwise1.weight", i), d_model, 2 * d_model);
         GET_CONV(b.conv_dw_w, lname("enc.blocks.%d.conv.depthwise.weight", i), k, 1, d_model);
-        GET_CONV(b.conv_pw2_w, lname("enc.blocks.%d.conv.pointwise2.weight", i), 1, d_model, d_model);
+        GET_PW(b.conv_pw2_w, lname("enc.blocks.%d.conv.pointwise2.weight", i), d_model, d_model);
         GET_F32(b.conv_bn_w, lname("enc.blocks.%d.conv.bn.weight", i), d_model);
         GET_F32(b.conv_bn_b, lname("enc.blocks.%d.conv.bn.bias", i), d_model);
         if (hp.enc_conv_norm_type == ParakeetHParams::ConvNormType::BatchNorm) {
