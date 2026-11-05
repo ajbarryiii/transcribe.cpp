@@ -58,6 +58,7 @@ def add_general_identity(
     source_url: str | None = None,
     description: str | None = None,
     tags: list[str] | None = None,
+    base_models: list[dict[str, str]] | None = None,
 ) -> None:
     """Write the conventional `general.*` identity block for a converter.
 
@@ -94,6 +95,10 @@ def add_general_identity(
                     format (provenance; e.g. an upstream GitHub repo).
       description   one-paragraph free-form description.
       tags          search/classification tags.
+      base_models   models this one derives from, each a dict with "name"
+                    and optionally "organization" and "repo_url"; written
+                    as llama.cpp's general.base_model.count and
+                    general.base_model.{i}.* keys.
     """
     if not name:
         raise ValueError("general.name is required")
@@ -134,6 +139,13 @@ def add_general_identity(
         writer.add_array("general.languages",  languages)
     if tags is not None:
         writer.add_array("general.tags",   tags)
+    if base_models:
+        writer.add_uint32("general.base_model.count", len(base_models))
+        for i, base in enumerate(base_models):
+            writer.add_string(f"general.base_model.{i}.name", base["name"])
+            for field in ("organization", "repo_url"):
+                if base.get(field):
+                    writer.add_string(f"general.base_model.{i}.{field}", base[field])
 
 
 # llama.cpp / whisper.cpp tokenizer.ggml.token_type values. We follow
