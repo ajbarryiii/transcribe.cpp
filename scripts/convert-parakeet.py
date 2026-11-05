@@ -75,6 +75,11 @@ weights as ggml Q1_0 and its int8 weights as Q8_0 (--keab-int8 f16 for F16):
 
     uv run --project scripts/envs/parakeet scripts/convert-parakeet.py \
       BUNDLE_DIR models/kea-b-0.1/kea-b-0.1-Q1_0.gguf --keab-weights q1_0
+
+kea-b was trained with per-frame INT8 inputs to its 264 binary layers, so
+its GGUF also gets stt.parakeet.encoder.input_quant = "int8_per_frame"
+(the input of every conformer projection, quantized as in training);
+--keab-input-quant none leaves it out (float inputs).
 """
 
 from __future__ import annotations
@@ -947,6 +952,7 @@ def load_keab_bundle(model_spec: str, weights: str, int8_type: str) -> _HfSafete
     elif weights != "f32":
         raise ValueError(f"unknown kea-b weights mode {weights!r}")
     model.packed = packed
+    model.binary_layers = sorted(bundle.binary)
     print(f"  {len(bundle.binary)} binary layers, {len(bundle.int8)} int8 tensors, "
           f"weights={weights}" + (f", int8={int8_type}" if weights == "q1_0" else ""))
     return model
@@ -1691,9 +1697,24 @@ def tensor_to_fp32_numpy(t) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+# The conformer projections stt.parakeet.encoder.input_quant applies to
+# (src/conformer: FF linear1/2, attention q/k/v/out/pos, conv pointwise 1/2).
+_INPUT_QUANT_MODULES = (
+    "feed_forward1.linear1", "feed_forward1.linear2",
+    "self_attn.linear_q", "self_attn.linear_k", "self_attn.linear_v",
+    "self_attn.linear_out", "self_attn.linear_pos",
+    "conv.pointwise_conv1", "conv.pointwise_conv2",
+    "feed_forward2.linear1", "feed_forward2.linear2",
+)
+
+
+def input_quant_modules(n_layers: int) -> set[str]:
+    return {f"encoder.layers.{i}.{m}" for i in range(n_layers) for m in _INPUT_QUANT_MODULES}
+
+
 def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
             revision: str | None = None, keab_weights: str = "f32",
-            keab_int8: str = "q8_0") -> None:
+            keab_int8: str = "q8_0", keab_input_quant: str = "int8_per_frame") -> None:
     from omegaconf import OmegaConf
 
     # The output slug is the canonical variant key. main() always sets
@@ -1723,8 +1744,8 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
 
     has_vad_head = bool(profile.get("has_vad_head", False))
     is_keab = profile.get("source_format") == "keab_bundle"
-    if not is_keab and (keab_weights != "f32" or keab_int8 != "q8_0"):
-        raise ValueError("--keab-weights / --keab-int8 apply only to kea-b bundle variants")
+    if not is_keab and (keab_weights != "f32" or keab_int8 != "q8_0" or keab_input_quant != "int8_per_frame"):
+        raise ValueError("--keab-weights / --keab-int8 / --keab-input-quant apply only to kea-b bundle variants")
     if is_keab and keab_weights == "q1_0":
         print("Output dtype: Q1_0 binary weights, "
               f"{keab_int8.upper()} int8 weights, F32 elsewhere")
@@ -2113,6 +2134,18 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None,
         writer.add_string("stt.parakeet.encoder.length_masking", "transformers")
         writer.add_string("stt.parakeet.tdt.symbol_budget", "global")
 
+    # kea-b's activation quantizer covers its binary layers; the runtime's
+    # covers every conformer projection. Write the key only when the two
+    # sets are the same.
+    if is_keab and keab_input_quant == "int8_per_frame":
+        binary = set(model.binary_layers)
+        expected = input_quant_modules(hp["enc_n_layers"])
+        if binary != expected:
+            raise ValueError(
+                "kea-b input quantization: binary layers differ from the conformer projections "
+                f"(only binary: {sorted(binary - expected)[:3]}, only projections: {sorted(expected - binary)[:3]})")
+        writer.add_string("stt.parakeet.encoder.input_quant", "int8_per_frame")
+
     # VAD head shape from the checkpoint; segmenter constants are kestrel's
     # runtime policy, written here so the C++ does not hard-code a copy.
     if has_vad_head:
@@ -2374,6 +2407,14 @@ def main(argv: list[str]) -> int:
         help="kea-b with --keab-weights q1_0: store the int8 weights as "
              "Q8_0 (codes with d = fp16(scale)) or as F16 W8 = fp16(q * s).",
     )
+    p.add_argument(
+        "--keab-input-quant",
+        choices=("int8_per_frame", "none"),
+        default="int8_per_frame",
+        help="kea-b bundles only: int8_per_frame (default) runs the encoder "
+             "with the per-frame INT8 projection inputs kea-b was trained "
+             "with; none keeps float inputs.",
+    )
     args = p.parse_args(argv[1:])
 
     out_path = args.out_path
@@ -2396,7 +2437,8 @@ def main(argv: list[str]) -> int:
     if repo_id is None and "/" in args.model and not Path(args.model).exists():
         repo_id = args.model
     convert(args.model, out_path, repo_id=repo_id, revision=args.revision,
-            keab_weights=args.keab_weights, keab_int8=args.keab_int8)
+            keab_weights=args.keab_weights, keab_int8=args.keab_int8,
+            keab_input_quant=args.keab_input_quant)
     return 0
 
 

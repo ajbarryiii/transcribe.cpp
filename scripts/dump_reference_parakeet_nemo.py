@@ -222,7 +222,74 @@ def load_binary_view(root: Path):
                 cfg[ds] = None
     model = EncDecRNNTBPEModel(cfg=cfg)
     model.load_state_dict({k: torch.from_numpy(v) for k, v in state.items()}, strict=True)
-    return model.to(dtype=torch.float32)
+    model = model.to(dtype=torch.float32)
+    model.binary_layers = sorted(manifest["quantized_layers"])
+    return model
+
+
+INPUT_QUANT_CHOICES = ("auto", "int8_per_frame", "none")
+
+
+def fake_quant_int8_per_frame(x, dim: int):
+    """kea-b's activation quantizer, per frame across `dim`: s = max(max|x| /
+    127, 1e-30), q = round-half-even(x / s), x' = q * s, in FP32, returned in
+    x's dtype. The CPU path of its training code (wilderness-labs-stt
+    finetune/relabel/training/actquant.py, reference())."""
+    import torch
+
+    with torch.no_grad():
+        moved = x.detach().to(torch.float32).movedim(dim, -1)
+        amax = moved.abs().amax(dim=-1)
+        s = (amax / torch.full_like(amax, 127.0)).clamp_min(1e-30)
+        q = torch.round(moved / s.unsqueeze(-1))
+        return (q * s.unsqueeze(-1)).movedim(-1, dim).to(x.dtype)
+
+
+def install_input_quant(model, mode: str) -> dict[str, int] | None:
+    """Apply --input-quant to `model`. auto = int8_per_frame on a binary
+    export (kea-b was trained with it), none otherwise. int8_per_frame
+    replaces the input of every binary layer with fake_quant_int8_per_frame
+    of it (a forward pre-hook, as in training: linears across their input
+    features, pointwise convs across channels). Install after any attention
+    switch, which rebuilds the attention modules. Returns {layer: calls}
+    for check_input_quant, or None when nothing is quantized."""
+    import torch
+
+    layers = getattr(model, "binary_layers", None)
+    if mode == "auto":
+        mode = "int8_per_frame" if layers else "none"
+    if mode == "none":
+        return None
+    if not layers:
+        raise SystemExit("--input-quant int8_per_frame needs a binary-weight export")
+    calls: dict[str, int] = {}
+    for name in layers:
+        module = model.get_submodule(name)
+        if isinstance(module, torch.nn.Linear):
+            dim = -1
+        elif isinstance(module, torch.nn.Conv1d) and module.kernel_size == (1,):
+            dim = 1
+        else:
+            raise SystemExit(f"{name}: {type(module).__name__} is not a binary layer type")
+        calls[name] = 0
+
+        def hook(mod, inputs, name=name, dim=dim):
+            calls[name] += 1
+            return (fake_quant_int8_per_frame(inputs[0], dim),) + tuple(inputs[1:])
+
+        module.register_forward_pre_hook(hook)
+    print(f"input quantization: int8_per_frame on {len(calls)} binary layers")
+    return calls
+
+
+def check_input_quant(calls: dict[str, int] | None) -> None:
+    """Fail unless every hooked layer ran (a module the forward bypasses
+    would silently stay unquantized)."""
+    if calls is None:
+        return
+    idle = sorted(n for n, c in calls.items() if c == 0)
+    if idle:
+        raise SystemExit(f"input quantization never ran on {len(idle)} layers, e.g. {idle[:3]}")
 
 
 def load_model(args: argparse.Namespace):
@@ -282,6 +349,8 @@ def load_model(args: argparse.Namespace):
         if style != "regular":
             raise SystemExit(f"--att-context applies to regular-style encoders; this one is {style!r}")
         print(switch_attention(model, left, right))
+    model.input_quant_calls = install_input_quant(model, getattr(args, "input_quant", "auto"))
+    args.input_quant = "int8_per_frame" if model.input_quant_calls is not None else "none"
     return model
 
 
@@ -362,6 +431,7 @@ def make_source(
     source: dict[str, Any] = {
         "kind": "parakeet-nemo",
         "model": args.model,
+        "input_quant": getattr(args, "input_quant", "none"),
         "model_dtype": "f32",
         "device": "cpu",
         "torch_threads": args.torch_threads,
@@ -753,6 +823,7 @@ def cmd_encoder(args: argparse.Namespace) -> int:
     for layer, original_forward in restore_cbs:
         layer.forward = original_forward
 
+    check_input_quant(getattr(model, "input_quant_calls", None))
     return 0
 
 
@@ -1056,6 +1127,7 @@ def cmd_streaming(args: argparse.Namespace) -> int:
         }, f, indent=2)
     print(f"streaming: wrote {history_path}")
 
+    check_input_quant(getattr(model, "input_quant_calls", None))
     return 0
 
 
@@ -1432,6 +1504,7 @@ def cmd_buffered_streaming(args: argparse.Namespace) -> int:
     print(f"buffered streaming: wrote {history_path}")
     print(f"final transcript: {final_text!r}")
 
+    check_input_quant(getattr(model, "input_quant_calls", None))
     return 0
 
 
@@ -1544,6 +1617,7 @@ def cmd_decode(args: argparse.Namespace) -> int:
         print(f"  Transcription: {text}")
         write_transcript(out_dir, text, source=source)
 
+    check_input_quant(getattr(model, "input_quant_calls", None))
     return 0
 
 
@@ -1587,6 +1661,17 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
             "models like nemotron-speech-streaming-en-0.6b — those must run "
             "with their native chunked_limited mask to reproduce published WER. "
             "Default off: preserve the model's native att_context_style."
+        ),
+    )
+    p.add_argument(
+        "--input-quant",
+        choices=INPUT_QUANT_CHOICES,
+        default="auto",
+        help=(
+            "Activation quantization of binary-weight exports (kea-b): "
+            "int8_per_frame quantizes the input of every binary layer per "
+            "frame as in training; none runs float inputs. auto (default): "
+            "int8_per_frame for binary exports, none otherwise."
         ),
     )
     p.add_argument(

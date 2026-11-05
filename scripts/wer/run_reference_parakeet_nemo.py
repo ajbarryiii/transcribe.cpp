@@ -94,6 +94,14 @@ def main() -> int:
                        "as tdt_ctc-1.1b). Unset = the checkpoint's own "
                        "attention."
                    ))
+    p.add_argument("--input-quant", choices=("auto", "int8_per_frame", "none"), default="auto",
+                   help=(
+                       "Activation quantization of binary-weight exports "
+                       "(kea-b): int8_per_frame quantizes the input of every "
+                       "binary layer per frame as in training; none runs float "
+                       "inputs. auto (default): int8_per_frame for binary "
+                       "exports, none otherwise."
+                   ))
     p.add_argument("--allow-errors", action="store_true",
                    help=(
                        "Exit 0 when some (not all) utterances fail. Failures "
@@ -137,6 +145,8 @@ def main() -> int:
     from dump_reference_parakeet_nemo import (
         _binary_view,
         _patch_conformer_for_offline,
+        check_input_quant,
+        install_input_quant,
         apply_att_context_right_override,
         load_binary_view,
         is_prompt_aware,
@@ -207,6 +217,9 @@ def main() -> int:
         except ValueError as e:
             print(f"error: --att-context: {e}", file=sys.stderr)
             return 2
+    # After the attention switch, which rebuilds the attention modules.
+    input_quant_calls = install_input_quant(model, args.input_quant)
+    input_quant = "int8_per_frame" if input_quant_calls is not None else "none"
     if args.device != "cpu":
         model = model.to(args.device)
     load_ms = (time.monotonic() - t0) * 1000
@@ -237,6 +250,7 @@ def main() -> int:
             "load_ms": round(load_ms, 1),
             "framework": "nemo",
             "model": args.model,
+            "input_quant": input_quant,
         }) + "\n")
         fout.flush()
 
@@ -366,6 +380,7 @@ def main() -> int:
         f"({n_done / wall:.2f} utt/s), {n_errors} errors"
     )
     print(f"report: {args.out}")
+    check_input_quant(input_quant_calls)
     if n_errors == 0:
         return 0
     # --allow-errors: partial failures (recorded per utterance above) still
